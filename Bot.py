@@ -1,68 +1,77 @@
 import asyncio
 import logging
-import sys
-import os
 import datetime
+import httpx
 
 from aiogram import Bot, Dispatcher, types, html
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.filters import CommandStart
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from os import getenv
 import asyncpg
 from fastapi import FastAPI, Request
 
 # -------------------------
-# Настройки бота и базы
+# Настройки
 # -------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 TOKEN = getenv("BOT_TOKEN")
-DATABASE_URL = getenv("DATABASE_URL")  # Установить в Render
+DATABASE_URL = getenv("DATABASE_URL")
+BASE_URL = getenv("BASE_URL", "https://firsttelegrambothomework.onrender.com")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 if not TOKEN or not DATABASE_URL:
-    print("❌ Не найден BOT_TOKEN или DATABASE_URL в переменных окружения")
-    exit(1)
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-pool = None  # будет инициализирован позже
+    logger.error("❌ Не найден BOT_TOKEN или DATABASE_URL в переменных окружения")
+    raise SystemExit(1)
 
 # -------------------------
-# Состояния FSM
+# Bot / Dispatcher / Storage
+# -------------------------
+bot = None                # создадим в startup
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+pool = None  # будет инициализирован в init_db
+
+# -------------------------
+# FSM
 # -------------------------
 class DzStates(StatesGroup):
     choosing_subject = State()
     writing_homework = State()
 
-# -------------------------
-# Админы
-# -------------------------
 ADMINS = [1920672301, 5251769398]
 
+app = FastAPI()
+
 # -------------------------
-# Предметы и варианты
+# Список предметов и пр. (оставил как у тебя)
 # -------------------------
 subjects = [
     "Алгебра", "Русский язык", "Геометрия", "История",
     "Английский язык", "Физика", "Спецкурс по физике",
     "Биология", "Химия", "Информатика", "ОБЗР",
-    "Физкулькута", "Разговор о важном", "Литература",
+    "Физкультура", "Разговор о важном", "Литература",
     "География", "Обществознание", "ВиС", "БПЛА"
 ]
 
 DZ_VAR1 = [
-    ["Разговор о важном", "Физкулькута", "Химия", "Информатика", "Информатика", "Физика", "Физика"],
+    ["Разговор о важном", "Физкультура", "Химия", "Информатика", "Информатика", "Физика", "Физика"],
     ["Литература", "Литература", "Алгебра", "Алгебра", "Английский язык", "Английский язык", "ОБЗР"],
-    ["Информатика", "Информатика", "История", "История", "Геометрия", "Геометрия", "Физкулькута"],
+    ["Информатика", "Информатика", "История", "История", "Геометрия", "Геометрия", "Физкультура"],
     ["Английский язык", "Геометрия", "Русский язык", "Русский язык", "ВиС", "Биология", "БПЛА"],
     ["Литература", "Алгебра", "Алгебра", "География", "Обществознание", "Обществознание", "Спецкурс по физике"]
 ]
 
 DZ_VAR2 = [
-    ["Разговор о важном", "Физкулькута", "Химия", "Английский язык", "Английский язык", "Физика", "Физика"],
+    ["Разговор о важном", "Физкультура", "Химия", "Английский язык", "Английский язык", "Физика", "Физика"],
     ["Литература", "Литература", "Алгебра", "Алгебра", "Информатика", "Информатика", "ОБЗР"],
-    ["-", "Английский язык", "История", "История", "Геометрия", "Геометрия", "Физкулькута", "Информатика"],
+    ["-", "Английский язык", "История", "История", "Геометрия", "Геометрия", "Физкультура", "Информатика"],
     ["Информатика", "Геометрия", "Русский язык", "Русский язык", "ВиС", "Биология", "БПЛА"],
     ["Литература", "Алгебра", "Алгебра", "География", "Обществознание", "Обществознание", "Спецкурс по физике"]
 ]
@@ -82,13 +91,12 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 # -------------------------
-# Подключение к базе
+# Инициализация БД
 # -------------------------
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL)
     async with pool.acquire() as conn:
-        # Таблицы
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS UserInfo (
             id SERIAL PRIMARY KEY,
@@ -97,7 +105,6 @@ async def init_db():
             user_option INT
         )
         """)
-        # Таблица ДЗ
         cols = ', '.join([f'"{subj}" TEXT, "{subj}_date" TEXT' for subj in subjects])
         await conn.execute(f"""
         CREATE TABLE IF NOT EXISTS Dz_Table (
@@ -105,7 +112,6 @@ async def init_db():
             {cols}
         )
         """)
-        # Добавляем одну строку, если нет
         exists = await conn.fetchval("SELECT COUNT(*) FROM Dz_Table")
         if exists == 0:
             cols_names = ', '.join([f'"{subj}"' for subj in subjects])
@@ -113,29 +119,83 @@ async def init_db():
             await conn.execute(f'INSERT INTO Dz_Table ({cols_names}) VALUES ({values})')
 
 # -------------------------
-# FastAPI сервер для webhook
+# Health-check (чтобы не было 404 при keep-alive)
 # -------------------------
-app = FastAPI()
-WEBHOOK_PATH = f"/webhook/{TOKEN}"
-WEBHOOK_URL = f"https://firsttelegrambothomework.onrender.com{WEBHOOK_PATH}"
-
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = types.Update(**data)
-    await dp.feed_update(bot, update)
+@app.get("/")
+async def root():
     return {"ok": True}
 
-async def on_startup():
-    await init_db()
-    await bot.set_webhook(WEBHOOK_URL)
-    print("Webhook установлен:", WEBHOOK_URL)
+# -------------------------
+# Keep-alive
+# -------------------------
+KEEP_ALIVE_URL = BASE_URL  # ping root health-check
+
+async def keep_awake():
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.get(KEEP_ALIVE_URL, timeout=10)
+            logger.info("Keep-alive ping выполнен")
+        except Exception as e:
+            logger.error(f"Ошибка keep-alive: {e}")
+        await asyncio.sleep(600)  # 10 минут
 
 # -------------------------
-# Хелперы
+# Webhook endpoint
 # -------------------------
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    if bot is None:
+        logger.error("Bot not initialized yet, received update")
+        return {"ok": False}
+    update = await request.json()
+    asyncio.create_task(dp.feed_webhook_update(bot, update))
+    logger.info(f"Обновление: {update}")
+    return {"ok": True}
+
+# -------------------------
+# Startup / Shutdown
+# -------------------------
+@app.on_event("startup")
+async def on_startup():
+    global bot
+    logger.info("Starting up: init DB, bot, webhook, keep-alive")
+    # init db
+    await init_db()
+    # create bot (so its session binds to current loop)
+    bot = Bot(token=TOKEN)
+    # set webhook
+    await bot.set_webhook(WEBHOOK_URL)
+    logger.info(f"Webhook set to {WEBHOOK_URL}")
+    # start keep-alive background task
+    asyncio.create_task(keep_awake())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    logger.info("Shutting down: closing resources")
+    if pool:
+        await pool.close()
+    if bot:
+        try:
+            await bot.delete_webhook()
+        except Exception as e:
+            logger.error(f"Error deleting webhook: {e}")
+        try:
+            await bot.session.close()
+        except Exception:
+            try:
+                await bot.close()
+            except Exception:
+                pass
+    try:
+        await storage.close()
+    except Exception:
+        pass
+
 @dp.message(CommandStart())
 async def command_start_handler(message: Message):
+    if pool is None:
+        raise RuntimeError("Пул базы данных ещё не инициализирован")
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO UserInfo (user_id, user_name) VALUES ($1, $2) "
@@ -153,17 +213,25 @@ async def command_start_handler(message: Message):
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu(message.from_user.id))
 
 async def get_user_option(user_id: int):
+    if pool is None:
+        raise RuntimeError("Пул базы данных ещё не инициализирован")
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT user_option FROM UserInfo WHERE user_id=$1", user_id)
+        row = await conn.fetchrow(
+            "SELECT user_option FROM UserInfo WHERE user_id=$1", user_id
+        )
         return row["user_option"] if row else None
 
 async def get_homework_for_day(user_id: int, day_index: int):
+    if pool is None:
+        raise RuntimeError("Пул базы данных ещё не инициализирован")
     user_option = await get_user_option(user_id)
     if not user_option:
         return "❌ Сначала выбери вариант через кнопку '🔄 Сменить вариант'"
+    
     DZ = DZ_VAR1 if user_option == 1 else DZ_VAR2
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM Dz_Table WHERE id=1")
+    
     result = f"<b><u>{['Понедельник','Вторник','Среда','Четверг','Пятница'][day_index]} — Вариант {user_option}</u></b>\n\n"
     for i, subj in enumerate(DZ[day_index], start=1):
         if subj == "-":
@@ -177,13 +245,18 @@ async def get_homework_for_day(user_id: int, day_index: int):
             result += "\n"
     return result
 
+
 async def get_full_schedule(user_id: int):
+    if pool is None:
+        raise RuntimeError("Пул базы данных ещё не инициализирован")
     user_option = await get_user_option(user_id)
     if not user_option:
         return "❌ Сначала выбери вариант через кнопку '🔄 Сменить вариант'"
+    
     DZ = DZ_VAR1 if user_option == 1 else DZ_VAR2
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM Dz_Table WHERE id=1")
+    
     result = ""
     days = ["Понедельник","Вторник","Среда","Четверг","Пятница"]
     for i, day in enumerate(days):
@@ -201,6 +274,7 @@ async def get_full_schedule(user_id: int):
                 result += "\n"
         result += "\n"
     return result
+
 
 # -------------------------
 # Добавление ДЗ
@@ -250,9 +324,12 @@ async def add_dz_save(message: Message, state: FSMContext):
     RUS_MONTHS = ["Января","Февраля","Марта","Апреля","Мая","Июня",
                   "Июля","Августа","Сентября","Октября","Ноября","Декабря"]
     date_str = f"{RUS_DAYS[today.weekday()]}, {today.day} {RUS_MONTHS[today.month-1]}"
+    if pool is None:
+        raise RuntimeError("Пул базы данных ещё не инициализирован")
     async with pool.acquire() as conn:
         await conn.execute(f'UPDATE Dz_Table SET "{subject}"=$1, "{subject}_date"=$2 WHERE id=1',
-                           hw_text, date_str)
+                       hw_text, date_str)
+
     await message.answer(f"✅ ДЗ по <b>{subject}</b> обновлено:\n<b>{hw_text}</b> [{date_str}]",
                          parse_mode="HTML", reply_markup=get_main_menu(message.from_user.id))
     await state.clear()
@@ -306,19 +383,14 @@ async def handle_buttons(message: Message):
         await message.answer(text_variants, parse_mode="HTML", reply_markup=keyboard)
 
     elif text in ["1","2"]:
+        if pool is None:
+            raise RuntimeError("Пул базы данных ещё не инициализирован")
         async with pool.acquire() as conn:
-            await conn.execute("UPDATE UserInfo SET user_option=$1 WHERE user_id=$2", int(text), user_id)
+            await conn.execute(
+                "UPDATE UserInfo SET user_option=$1 WHERE user_id=$2", int(text), user_id
+            )
         await message.answer(f"Ты выбрал вариант {text} ✅", reply_markup=get_main_menu(user_id))
+
 
     else:
         await message.answer("❓ Не понял. Используй меню ниже:", reply_markup=get_main_menu(user_id))
-
-# -------------------------
-# Старт
-# -------------------------
-if __name__ == "__main__":
-    import uvicorn
-    # Сначала инициализируем базу и ставим webhook
-    asyncio.run(on_startup())
-    # Запускаем FastAPI
-    uvicorn.run(app, host="0.0.0.0", port=10000)
