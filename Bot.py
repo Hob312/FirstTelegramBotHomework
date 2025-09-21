@@ -2,6 +2,7 @@ import asyncio
 import logging
 import datetime
 import httpx
+import ssl as _ssl
 
 from aiogram import Bot, Dispatcher, types, html
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -21,12 +22,28 @@ logger = logging.getLogger(__name__)
 
 TOKEN = getenv("BOT_TOKEN")
 DATABASE_URL = getenv("DATABASE_URL")
-BASE_URL = getenv("BASE_URL", "https://firsttelegrambothomework.onrender.com")
+
+def _normalize_base_url(u: str) -> str:
+    return u[:-1] if u and u.endswith("/") else u
+
+BASE_URL = getenv("BASE_URL") or getenv("RENDER_EXTERNAL_URL")
+BASE_URL = _normalize_base_url(BASE_URL)
+
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
-if not TOKEN or not DATABASE_URL:
-    logger.error("❌ Не найден BOT_TOKEN или DATABASE_URL в переменных окружения")
+if not TOKEN:
+    logging.error("❌ Не задан BOT_TOKEN")
+    raise SystemExit(1)
+
+if not DATABASE_URL:
+    logging.error("❌ Не задан DATABASE_URL")
+    raise SystemExit(1)
+
+# Если по какой-то причине Render не выставил RENDER_EXTERNAL_URL (редко, но вдруг локально),
+# тогда просим указать BASE_URL вручную.
+if not BASE_URL:
+    logging.error("❌ Не найден ни BASE_URL, ни RENDER_EXTERNAL_URL. Укажи BASE_URL вручную, например https://<your-service>.onrender.com")
     raise SystemExit(1)
 
 # -------------------------
@@ -95,7 +112,15 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
 # -------------------------
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL)
+    # asyncpg любит префикс postgresql://; нормализуем, если вдруг postgres://
+    dsn = DATABASE_URL.replace("postgres://", "postgresql://")
+
+    # Многие хостинги требуют SSL. Создадим контекст и передадим в пул.
+    ssl_ctx = _ssl.create_default_context()
+
+    # Если у тебя уже есть ?sslmode=require в URL — всё равно можно передать ssl=ssl_ctx, это ок
+    pool = await asyncpg.create_pool(dsn, ssl=ssl_ctx)
+
     async with pool.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS UserInfo (
@@ -117,6 +142,21 @@ async def init_db():
             cols_names = ', '.join([f'"{subj}"' for subj in subjects])
             values = ', '.join(["'Ничего'" for _ in subjects])
             await conn.execute(f'INSERT INTO Dz_Table ({cols_names}) VALUES ({values})')
+
+async def init_db_with_retry(retries: int = 5, delay: int = 3):
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            logger.info(f"DB init attempt {attempt}/{retries} ...")
+            await init_db()
+            logger.info("DB init OK")
+            return
+        except Exception as e:
+            last_err = e
+            logger.error(f"DB init failed: {e!r}. Retry in {delay}s")
+            await asyncio.sleep(delay)
+    # если так и не поднялись — пробрасываем, чтобы упасть с понятной причиной
+    raise last_err
 
 # -------------------------
 # Health-check (чтобы не было 404 при keep-alive)
@@ -161,7 +201,7 @@ async def on_startup():
     global bot
     logger.info("Starting up: init DB, bot, webhook, keep-alive")
     # init db
-    await init_db()
+    await init_db_with_retry()
     # create bot (so its session binds to current loop)
     bot = Bot(token=TOKEN)
     # set webhook
