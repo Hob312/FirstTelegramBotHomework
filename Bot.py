@@ -6,6 +6,7 @@ import ssl as _ssl
 
 from aiogram import Bot, Dispatcher, types, html
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Update
 from aiogram.filters import CommandStart
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
@@ -112,14 +113,21 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
 # -------------------------
 async def init_db():
     global pool
-    # asyncpg любит префикс postgresql://; нормализуем, если вдруг postgres://
+    # Нормализуем DSN для asyncpg
     dsn = DATABASE_URL.replace("postgres://", "postgresql://")
 
-    # Многие хостинги требуют SSL. Создадим контекст и передадим в пул.
-    ssl_ctx = _ssl.create_default_context()
-
-    # Если у тебя уже есть ?sslmode=require в URL — всё равно можно передать ssl=ssl_ctx, это ок
-    pool = await asyncpg.create_pool(dsn, ssl=ssl_ctx)
+    # 1) Пытаемся подключиться с проверкой сертификата (рекомендуемый вариант)
+    verified_ctx = _ssl.create_default_context()
+    try:
+        pool = await asyncpg.create_pool(dsn, ssl=verified_ctx)
+    except _ssl.SSLCertVerificationError as e:
+        logger.warning("SSL verification failed (self-signed cert). Falling back to UNVERIFIED SSL context. "
+                       "Это небезопасно в проде — по возможности настроить доверенный сертификат или sslmode=require.")
+        # 2) Фоллбэк: отключаем проверку сертификата/host
+        unverified_ctx = _ssl.create_default_context()
+        unverified_ctx.check_hostname = False
+        unverified_ctx.verify_mode = _ssl.CERT_NONE
+        pool = await asyncpg.create_pool(dsn, ssl=unverified_ctx)
 
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -188,10 +196,16 @@ async def telegram_webhook(request: Request):
     if bot is None:
         logger.error("Bot not initialized yet, received update")
         return {"ok": False}
-    update = await request.json()
-    asyncio.create_task(dp.feed_webhook_update(bot, update))
-    logger.info(f"Обновление: {update}")
-    return {"ok": True}
+    try:
+        raw = await request.json()
+        update = Update.model_validate(raw)  # строгая валидация
+        asyncio.create_task(dp.feed_webhook_update(bot, update))
+        logger.info("Update OK: %s", raw.get("update_id"))
+        return {"ok": True}
+    except Exception as e:
+        # Чтобы не терять ошибки вообще
+        logger.exception(f"Webhook error: {e}")
+        return {"ok": False}
 
 # -------------------------
 # Startup / Shutdown
