@@ -68,7 +68,7 @@ ADMINS = [1920672301, 5251769398]
 app = FastAPI()
 
 # -------------------------
-# Список предметов и пр. (оставил как у тебя)
+# Список предметов
 # -------------------------
 subjects = [
     "Алгебра", "Русский язык", "Геометрия", "История",
@@ -102,7 +102,7 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📅 Дз на сегодня")],
         [KeyboardButton(text="📅 Дз на завтра")],
         [KeyboardButton(text="📖 Полное расписание")],
-        [KeyboardButton(text="🔄 Сменить вариант")]
+        [KeyboardButton(text="🔄 Сменить вариант группы")]
     ]
     if user_id in ADMINS:
         buttons.append([KeyboardButton(text="Добавить ДЗ")])
@@ -412,22 +412,27 @@ async def handle_buttons(message: Message):
         full_schedule = await get_full_schedule(user_id)
         await message.answer(full_schedule, parse_mode="HTML", reply_markup=get_main_menu(user_id))
 
-    elif text == "🔄 Сменить вариант":
-        await message.answer("<b>Выбери свой вариант:</b>", parse_mode="HTML")
+    elif text == "🔄 Сменить вариант группы":
+        await message.answer("<b>Выбери свой вариант группы:</b>", parse_mode="HTML")
 
         variant1 = ["Зизевский Пётр", "Каримов Артур", "Старостин Матвей", "Чернов Степан", "И т.д."]
         variant2 = ["Лазарев Данила", "Ананьев Григорий", "Гарипов Руслан", "Глотов Всеволод", "И т.д."]
 
         max_len = max(max(len(name) for name in variant1), max(len(name) for name in variant2)) + 4
         lines = []
+
+        # Заголовки
+        header = f"{'Вариант 1:'.ljust(max_len)}Вариант 2:"
+        lines.append(header)
+
+        # Сами варианты
         for i in range(max(len(variant1), len(variant2))):
             name1 = variant1[i] if i < len(variant1) else ""
             name2 = variant2[i] if i < len(variant2) else ""
             lines.append(f"{name1.ljust(max_len)}{name2}")
 
-        text_variants = "<pre>Вариант 1:".ljust(max_len) + "Вариант 2:\n"
-        text_variants += "\n".join(lines)
-        text_variants += "</pre>"
+        # Оборачиваем всё в <pre>
+        text_variants = "<pre>" + "\n".join(lines) + "</pre>"
 
         keyboard = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="1"), KeyboardButton(text="2")]],
