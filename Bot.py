@@ -396,6 +396,19 @@ async def handle_buttons(message: Message):
     user_id = message.from_user.id
     text = message.text
 
+    if pool is not None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO UserInfo (user_id, user_name)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE
+                SET user_name = EXCLUDED.user_name
+                """,
+                message.from_user.id,
+                message.from_user.first_name
+            )
+
     if text == "📅 Дз на сегодня":
         current_day = datetime.datetime.today().weekday()
         if current_day > 4: current_day = 0
