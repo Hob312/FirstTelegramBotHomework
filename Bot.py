@@ -198,12 +198,11 @@ async def telegram_webhook(request: Request):
         return {"ok": False}
     try:
         raw = await request.json()
+        logger.info(f"Incoming webhook: {raw.get('update_id')}")
         update = Update.model_validate(raw)  # строгая валидация
-        asyncio.create_task(dp.feed_webhook_update(bot, update))
-        logger.info("Update OK: %s", raw.get("update_id"))
+        await dp.feed_update(bot, update)   # <-- ВАЖНО: дожидаемся обработки
         return {"ok": True}
     except Exception as e:
-        # Чтобы не терять ошибки вообще
         logger.exception(f"Webhook error: {e}")
         return {"ok": False}
 
@@ -214,14 +213,25 @@ async def telegram_webhook(request: Request):
 async def on_startup():
     global bot
     logger.info("Starting up: init DB, bot, webhook, keep-alive")
-    # init db
     await init_db_with_retry()
-    # create bot (so its session binds to current loop)
+
     bot = Bot(token=TOKEN)
-    # set webhook
-    await bot.set_webhook(WEBHOOK_URL)
+
+    # Переустанавливаем вебхук жёстко
+    await bot.set_webhook(
+        WEBHOOK_URL,
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query"]
+    )
     logger.info(f"Webhook set to {WEBHOOK_URL}")
-    # start keep-alive background task
+
+    # Диагностика: что видит Telegram
+    try:
+        info = await bot.get_webhook_info()
+        logger.info(f"Webhook info: url={info.url!r} pending={info.pending_update_count} last_error_date={getattr(info, 'last_error_date', None)} last_error_message={getattr(info,'last_error_message', None)}")
+    except Exception as e:
+        logger.error(f"get_webhook_info failed: {e}")
+
     asyncio.create_task(keep_awake())
 
 @app.on_event("shutdown")
